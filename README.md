@@ -4,6 +4,27 @@ iPhone GPS Bridge exposes the latest iPhone location as a newline-delimited TCP
 stream. It emits one JSON record followed by two NMEA 0183 sentences every
 second, even when the coordinates have not changed.
 
+## Run the GPS emulator
+
+For testing without an iPhone, start the dependency-free Python emulator with a
+starting latitude and longitude:
+
+```bash
+python3 gps_emulator.py LATITUDE LONGITUDE
+```
+
+It listens on TCP port `10110` and moves northeast at a normal-car speed of
+50 km/h by default. Configure the speed and direction (bearing clockwise from
+north) when needed:
+
+```bash
+python3 gps_emulator.py LATITUDE LONGITUDE --speed 60 --bearing 90
+```
+
+Connect to it in another terminal with `nc 127.0.0.1 10110`. Use `--host` or
+`--port` to change the listener; run `python3 gps_emulator.py --help` for all
+options. Stop the emulator with Control-C.
+
 ## Install and prepare the iPhone app
 
 The app must be installed on the iPhone before either laptop setup below can be
