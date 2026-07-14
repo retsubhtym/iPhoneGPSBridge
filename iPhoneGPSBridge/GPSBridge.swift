@@ -17,7 +17,21 @@ final class GPSBridge: NSObject, ObservableObject {
     @Published private(set) var speed: Double?
     @Published private(set) var lastError: String?
 
-    let port: UInt16 = 10110
+    @Published var port: UInt16 = 10110 {
+        didSet {
+            guard port != oldValue, isRunning else { return }
+            stop()
+            start()
+        }
+    }
+
+    var iproxyCommand: String {
+        "iproxy \(port) \(port)"
+    }
+
+    var netcatCommand: String {
+        "nc 127.0.0.1 \(port)"
+    }
 
     private let locationManager = CLLocationManager()
     private let server = TCPLocationServer()
