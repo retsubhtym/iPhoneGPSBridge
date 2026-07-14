@@ -21,6 +21,26 @@ north) when needed:
 python3 gps_emulator.py LATITUDE LONGITUDE --speed 60 --bearing 90
 ```
 
+To follow streets instead of moving in a straight line, supply a destination:
+
+```bash
+python3 gps_emulator.py START_LATITUDE START_LONGITUDE \
+  --destination DESTINATION_LATITUDE DESTINATION_LONGITUDE
+```
+
+The emulator requests one driving route at startup from the free
+[FOSSGIS OSRM service](https://routing.openstreetmap.de/about.html), which uses
+[OpenStreetMap](https://www.openstreetmap.org/) road data, and follows the
+returned street geometry until it reaches the destination. No API key or Python
+package is required. This public service is intended for light use only:
+identify requests, make no more than one request per second, and do not scrape
+it. Route requests are logged by the provider. Map data is © OpenStreetMap
+contributors and available under the
+[Open Database License](https://www.openstreetmap.org/copyright). Problems in
+the road data can be reported through
+[Fix the map](https://www.openstreetmap.org/fixthemap). You can point
+`--routing-url` at a self-hosted or different OSRM-compatible server.
+
 Connect to it in another terminal with `nc 127.0.0.1 10110`. Use `--host` or
 `--port` to change the listener; run `python3 gps_emulator.py --help` for all
 options. Stop the emulator with Control-C.

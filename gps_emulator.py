@@ -5,6 +5,10 @@ import argparse
 import asyncio
 import json
 import math
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -12,6 +16,8 @@ from datetime import datetime, timezone
 EARTH_RADIUS_METERS = 6_371_000.0
 KILOMETERS_PER_HOUR_TO_METERS_PER_SECOND = 1.0 / 3.6
 METERS_PER_SECOND_TO_KNOTS = 1.9438444924406
+DEFAULT_ROUTING_URL = "https://routing.openstreetmap.de/routed-car"
+USER_AGENT = "iPhoneGPSBridge-GPSEmulator/1.0"
 
 
 @dataclass
@@ -39,6 +45,99 @@ def move(position: Position, distance_meters: float, bearing_degrees: float) -> 
     # Normalize longitude to [-180, 180).
     new_longitude = (new_longitude + math.pi) % (2.0 * math.pi) - math.pi
     return Position(math.degrees(new_latitude), math.degrees(new_longitude))
+
+
+def distance_between(start: Position, end: Position) -> float:
+    latitude_delta = math.radians(end.latitude - start.latitude)
+    longitude_delta = math.radians(end.longitude - start.longitude)
+    start_latitude = math.radians(start.latitude)
+    end_latitude = math.radians(end.latitude)
+    haversine = (
+        math.sin(latitude_delta / 2.0) ** 2
+        + math.cos(start_latitude)
+        * math.cos(end_latitude)
+        * math.sin(longitude_delta / 2.0) ** 2
+    )
+    return 2.0 * EARTH_RADIUS_METERS * math.asin(min(1.0, math.sqrt(haversine)))
+
+
+def bearing_between(start: Position, end: Position) -> float:
+    start_latitude = math.radians(start.latitude)
+    end_latitude = math.radians(end.latitude)
+    longitude_delta = math.radians(end.longitude - start.longitude)
+    x = math.sin(longitude_delta) * math.cos(end_latitude)
+    y = (
+        math.cos(start_latitude) * math.sin(end_latitude)
+        - math.sin(start_latitude)
+        * math.cos(end_latitude)
+        * math.cos(longitude_delta)
+    )
+    return math.degrees(math.atan2(x, y)) % 360.0
+
+
+def fetch_driving_route(
+    start: Position,
+    destination: Position,
+    routing_url: str,
+) -> tuple[list[Position], float]:
+    coordinates = (
+        f"{start.longitude:.8f},{start.latitude:.8f};"
+        f"{destination.longitude:.8f},{destination.latitude:.8f}"
+    )
+    query = urllib.parse.urlencode({"overview": "full", "geometries": "geojson"})
+    url = f"{routing_url.rstrip('/')}/route/v1/driving/{coordinates}?{query}"
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = json.load(response)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"routing request failed: {error}") from error
+
+    if result.get("code") != "Ok" or not result.get("routes"):
+        message = result.get("message") or result.get("code") or "no route found"
+        raise RuntimeError(f"routing service returned: {message}")
+
+    route = result["routes"][0]
+    raw_coordinates = route.get("geometry", {}).get("coordinates", [])
+    if len(raw_coordinates) < 2:
+        raise RuntimeError("routing service returned no usable route geometry")
+
+    positions = [
+        Position(float(latitude), float(longitude))
+        for longitude, latitude in raw_coordinates
+    ]
+    return positions, float(route.get("distance", 0.0))
+
+
+class RouteFollower:
+    def __init__(self, positions: list[Position]) -> None:
+        self.positions = positions
+        self.position = positions[0]
+        self.next_index = 1
+        self.bearing = bearing_between(positions[0], positions[1])
+        self.finished = False
+
+    def advance(self, distance_meters: float) -> tuple[Position, float, bool]:
+        while distance_meters > 0.0 and self.next_index < len(self.positions):
+            target = self.positions[self.next_index]
+            segment_distance = distance_between(self.position, target)
+            if segment_distance < 0.01:
+                self.position = target
+                self.next_index += 1
+                continue
+
+            self.bearing = bearing_between(self.position, target)
+            if distance_meters < segment_distance:
+                self.position = move(self.position, distance_meters, self.bearing)
+                distance_meters = 0.0
+            else:
+                self.position = target
+                self.next_index += 1
+                distance_meters -= segment_distance
+
+        self.finished = self.next_index >= len(self.positions)
+        return self.position, self.bearing, self.finished
 
 
 def nmea_coordinate(degrees: float, degree_digits: int) -> tuple[str, str]:
@@ -101,11 +200,22 @@ def encode_fix(
 
 
 class GPSEmulator:
-    def __init__(self, position: Position, speed_kmh: float, bearing: float) -> None:
+    def __init__(
+        self,
+        position: Position,
+        speed_kmh: float,
+        bearing: float,
+        route: list[Position] | None = None,
+    ) -> None:
         self.position = position
         self.speed_meters_per_second = speed_kmh * KILOMETERS_PER_HOUR_TO_METERS_PER_SECOND
         self.bearing = bearing % 360.0
         self.clients: set[asyncio.StreamWriter] = set()
+        self.route_follower = RouteFollower(route) if route else None
+        if self.route_follower:
+            self.position = self.route_follower.position
+            self.bearing = self.route_follower.bearing
+        self.route_finished = False
 
     async def accept(self, _reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.clients.add(writer)
@@ -127,15 +237,17 @@ class GPSEmulator:
             now = loop.time()
             elapsed = now - previous_update
             previous_update = now
-            self.position = move(
-                self.position,
-                self.speed_meters_per_second * elapsed,
-                self.bearing,
-            )
+            current_speed = 0.0 if self.route_finished else self.speed_meters_per_second
+            if self.route_follower:
+                self.position, self.bearing, self.route_finished = self.route_follower.advance(
+                    current_speed * elapsed
+                )
+            else:
+                self.position = move(self.position, current_speed * elapsed, self.bearing)
             payload = encode_fix(
                 self.position,
                 datetime.now(timezone.utc),
-                self.speed_meters_per_second,
+                current_speed,
                 self.bearing,
             )
 
@@ -161,6 +273,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("longitude", type=float, help="start longitude in decimal degrees")
     parser.add_argument("--speed", type=float, default=50.0, metavar="KM/H", help="speed (default: 50)")
     parser.add_argument("--bearing", type=float, default=45.0, metavar="DEGREES", help="direction clockwise from north (default: 45)")
+    parser.add_argument(
+        "--destination",
+        type=float,
+        nargs=2,
+        metavar=("LATITUDE", "LONGITUDE"),
+        help="destination; follow a driving route instead of a straight line",
+    )
+    parser.add_argument(
+        "--routing-url",
+        default=DEFAULT_ROUTING_URL,
+        help=f"OSRM server base URL (default: {DEFAULT_ROUTING_URL})",
+    )
     parser.add_argument("--host", default="0.0.0.0", help="listen address (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=10110, help="TCP port (default: 10110)")
     args = parser.parse_args()
@@ -169,6 +293,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("latitude must be between -90 and 90")
     if not -180.0 <= args.longitude <= 180.0:
         parser.error("longitude must be between -180 and 180")
+    if args.destination:
+        destination_latitude, destination_longitude = args.destination
+        if not -90.0 <= destination_latitude <= 90.0:
+            parser.error("destination latitude must be between -90 and 90")
+        if not -180.0 <= destination_longitude <= 180.0:
+            parser.error("destination longitude must be between -180 and 180")
     if args.speed < 0.0:
         parser.error("speed cannot be negative")
     if not 1 <= args.port <= 65535:
@@ -177,7 +307,20 @@ def parse_args() -> argparse.Namespace:
 
 
 async def run(args: argparse.Namespace) -> None:
-    emulator = GPSEmulator(Position(args.latitude, args.longitude), args.speed, args.bearing)
+    start = Position(args.latitude, args.longitude)
+    route = None
+    if args.destination:
+        destination = Position(*args.destination)
+        print("Requesting driving route from OpenStreetMap/OSRM...")
+        route, route_distance = await asyncio.to_thread(
+            fetch_driving_route,
+            start,
+            destination,
+            args.routing_url,
+        )
+        print(f"Loaded {route_distance / 1000.0:.2f} km street route ({len(route)} points)")
+
+    emulator = GPSEmulator(start, args.speed, args.bearing, route)
     server = await asyncio.start_server(emulator.accept, args.host, args.port)
     addresses = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
     print(
@@ -200,6 +343,9 @@ def main() -> None:
         asyncio.run(run(args))
     except KeyboardInterrupt:
         print("\nStopped")
+    except (OSError, RuntimeError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
 
 
 if __name__ == "__main__":
